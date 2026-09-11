@@ -13,8 +13,6 @@ import sirilpy as s
 DRIZZLE_KERNEL = "square"
 
 
-# Percentage of best frames to keep. 100 disables a filter.
-
 USE_WEIGHTED_FWHM = True
 DARK_TEMP_WARNING_C = 5.0
 
@@ -101,9 +99,15 @@ def choose_dark(darks, exposure, gain, temperature):
     if not candidates:
         return None
 
+    # Temperature is deliberately not an exact-match requirement. The Dwarf's
+    # dark library may not contain a master at every captured temperature.
+    # Prefer the closest temperature; if tied, prefer the larger master.
     return min(
         candidates,
-        key=lambda dark: abs(dark["temperature"] - temperature),
+        key=lambda dark: (
+            abs(dark["temperature"] - temperature),
+            -dark["stack_count"],
+        ),
     )
 
 
@@ -142,10 +146,10 @@ def copy_as_sequence(files, destination):
 
 def filter_args(
     filter_fwhm=100.0,
+    wfwhm_percent=100.0,
     filter_round=100.0,
     filter_background=100.0,
     filter_star_count=100.0,
-    wfwhm_percent=100.0,
 ):
     args = []
 
@@ -254,33 +258,26 @@ def main():
         if not darks:
             raise RuntimeError("No master darks found.")
 
-        # Process each night as its own unit. Within a night, split by
-        # temperature as well as exposure, gain and filter so every light is
-        # calibrated with the exact matching dark. Date is an outer processing
-        # boundary, but is never used when selecting the dark master.
-        nights = defaultdict(list)
+        # Group the entire archive by shot statistics. The capture date is
+        # deliberately ignored: matching exposure/gain/temperature/filter
+        # frames from different nights belong to the same calibration group.
+        groups = defaultdict(list)
         for light in lights:
-            nights[light["date"]].append(light)
-
-        groups = {}
-        for date in sorted(nights):
-            groups[date] = defaultdict(list)
-            for light in nights[date]:
-                key = (
-                    light["temperature"],
-                    round(light["exposure"], 3),
-                    round(light["gain"], 3),
-                    light["filter"],
-                )
-                groups[date][key].append(light)
+            key = (
+                light["temperature"],
+                light["exposure"],
+                light["gain"],
+                light["filter"],
+            )
+            groups[key].append(light)
 
         dark_for_group = {}
         dark_usage = []
 
-        total_groups = sum(len(groups[date]) for date in groups)
+        total_groups = len(groups)
         siril.log(
-            f"Found {len(lights)} lights across {len(nights)} nights and "
-            f"{total_groups} date/temp/exposure/gain/filter groups.",
+            f"Found {len(lights)} lights and {total_groups} "
+            f"temperature/exposure/gain/filter groups.",
             s.LogColor.GREEN,
         )
         siril.log(
@@ -292,337 +289,301 @@ def main():
             s.LogColor.GREEN,
         )
 
-        for date in sorted(groups):
+        for key, group in sorted(groups.items()):
+            temperature, exposure, gain, filter_id = key
+
+            dark = choose_dark(darks, exposure, gain, temperature)
+            if dark is None:
+                raise RuntimeError(
+                    f"No dark for {exposure:g}s, gain {gain:g}."
+                )
+
+            dark_for_group[key] = dark
+            dark_usage.append((key, len(group), dark))
+
+            delta = abs(dark["temperature"] - temperature)
+
             siril.log(
-                f"Night {date}: {len(groups[date])} calibration groups.",
-                s.LogColor.BLUE,
+                f"{exposure:g}s gain {gain:g} {temperature:.1f}C ir_{filter_id} | "
+                f"{len(group)} lights | -> {dark['temperature']:.1f}C dark | "
+                f"delta {delta:.1f}C",
+                s.LogColor.GREEN,
+            )
+            siril.log(
+                f"  Dark selected: {os.path.basename(dark['path'])}",
+                s.LogColor.GREEN,
             )
 
-            for key, group in sorted(groups[date].items()):
-                temperature, exposure, gain, filter_id = key
-
-                dark = choose_dark(darks, exposure, gain, temperature)
-                if dark is None:
-                    raise RuntimeError(
-                        f"No dark for {exposure:g}s, gain {gain:g}, "
-                        f"{temperature:.1f}C."
-                    )
-
-                dark_for_group[(date, key)] = dark
-                dark_usage.append((date, key, len(group), dark))
-
-                delta = abs(dark["temperature"] - temperature)
-
+            if delta > DARK_TEMP_WARNING_C:
                 siril.log(
-                    f"{date} | {exposure:g}s gain {gain:g} {temperature:.1f}C ir_{filter_id} | "
-                    f"{len(group)} lights | -> {dark['temperature']:.1f}C dark | "
-                    f"delta {delta:.1f}C",
-                    s.LogColor.GREEN,
+                    f"WARNING: dark temperature differs by {delta:.1f}C.",
+                    s.LogColor.SALMON,
                 )
-                siril.log(
-                    f"  Dark selected: {os.path.basename(dark['path'])}",
-                    s.LogColor.GREEN,
-                )
-
-                if delta > DARK_TEMP_WARNING_C:
-                    siril.log(
-                        f"WARNING: dark temperature differs by {delta:.1f}C.",
-                        s.LogColor.SALMON,
-                    )
 
         remove(work_dir)
         os.makedirs(merged_dir, exist_ok=True)
 
-        # Process each date independently, with temperature as part of the
-        # calibration grouping. Each group is calibrated, registered, drizzled
-        # and stacked independently; the resulting group stacks are then
-        # aligned and combined into the final image.
-        stack_results = []
+        # Process each calibration group independently. Groups can contain
+        # frames from any number of nights; date is not a grouping dimension.
+        stack_results = {"1": [], "2": []}
         group_number = 0
 
-        for date in sorted(groups):
-            for key in sorted(groups[date]):
-                group_number += 1
-                temperature, exposure, gain, filter_id = key
-                group = groups[date][key]
-                dark = dark_for_group[(date, key)]
+        for key in sorted(groups):
+            group_number += 1
+            temperature, exposure, gain, filter_id = key
+            group = groups[key]
+            dark = dark_for_group[key]
 
-                tag = (
-                    f"{date}_{exposure:g}s_g{gain:g}_{temperature:.1f}C_ir{filter_id}"
+            tag = f"{exposure:g}s_g{gain:g}_{temperature:.1f}C_ir{filter_id}"
+            group_dir = os.path.join(work_dir, tag)
+            os.makedirs(group_dir, exist_ok=True)
+
+            siril.log(
+                f"[{group_number}/{total_groups}] "
+                f"Processing {exposure:g}s gain {gain:g} {temperature:.1f}C "
+                f"ir_{filter_id} ({len(group)} frames)",
+                s.LogColor.GREEN,
+            )
+            siril.log(
+                f"  Using dark: {os.path.basename(dark['path'])}",
+                s.LogColor.GREEN,
+            )
+
+            copy_as_sequence(
+                [x["path"] for x in group],
+                group_dir,
+            )
+
+            run(siril, "cd", group_dir)
+
+            shutil.copy2(
+                dark["path"],
+                os.path.join(group_dir, "master_dark.fits"),
+            )
+
+            flat_files = fits_files(flats_dir)
+            matching_flats = [
+                flat for flat in flat_files
+                if re.search(
+                    rf"(?:^|_)ir_{re.escape(filter_id)}(?:_|\.)",
+                    os.path.basename(flat),
+                    re.IGNORECASE,
                 )
-                group_dir = os.path.join(work_dir, tag)
-                os.makedirs(group_dir, exist_ok=True)
+            ]
+
+            if not matching_flats:
+                raise FileNotFoundError(
+                    f"No master flat for ir_{filter_id} found in flats/."
+                )
+
+            if len(matching_flats) > 1:
+                raise RuntimeError(
+                    f"Expected exactly one master flat for ir_{filter_id}, "
+                    f"found {len(matching_flats)}."
+                )
+
+            flat_path = matching_flats[0]
+            siril.log(
+                f"  Using flat: {flat_path}",
+                s.LogColor.GREEN,
+            )
+            shutil.copy2(
+                flat_path,
+                os.path.join(group_dir, "master_flat.fits"),
+            )
+
+            group_result_name = f"{result_name}_{tag}"
+
+            if len(group) == 1:
+                # A single frame cannot benefit from registration/drizzle or
+                # rejection. Debayer it so it can participate in the final
+                # filter-specific merge.
+                single_input = os.path.join(group_dir, "light_000001.fit")
+                single_output = os.path.join(group_dir, "cal_light_000001.fit")
 
                 siril.log(
-                    f"[{group_number}/{total_groups}] "
-                    f"Processing {date} | {exposure:g}s gain {gain:g} {temperature:.1f}C "
-                    f"ir_{filter_id} ({len(group)} frames)",
+                    f"Calibrating single frame for {tag}...",
                     s.LogColor.GREEN,
                 )
-                siril.log(
-                    f"  Using dark: {os.path.basename(dark['path'])}",
-                    s.LogColor.GREEN,
-                )
-
-                copy_as_sequence(
-                    [x["path"] for x in group],
-                    group_dir,
-                )
-
-                run(siril, "cd", group_dir)
-
-                # Add the dark after creating the light sequence so Siril cannot
-                # mistake it for another light frame.
-                shutil.copy2(
-                    dark["path"],
-                    os.path.join(group_dir, "master_dark.fits"),
-                )
-
-                flat_files = fits_files(flats_dir)
-
-                matching_flats = [
-                    flat for flat in flat_files
-                    if re.search(
-                        rf"(?:^|_)ir_{re.escape(filter_id)}(?:_|\.)",
-                        os.path.basename(flat),
-                        re.IGNORECASE,
-                    )
-                ]
-
-                if not matching_flats:
-                    raise FileNotFoundError(
-                        f"No master flat for ir_{filter_id} found in flats/."
-                    )
-
-                if len(matching_flats) > 1:
-                    raise RuntimeError(
-                        f"Expected exactly one master flat for ir_{filter_id}, "
-                        f"found {len(matching_flats)}."
-                    )
-
-                flat_path = matching_flats[0]
-
-                siril.log(
-                    f"  Using flat: {flat_path}",
-                    s.LogColor.GREEN,
-                )
-
-                shutil.copy2(
-                    flat_path,
-                    os.path.join(group_dir, "master_flat.fits"),
-                )
-
-                group_result_name = f"{result_name}_{tag}"
-
-                if len(group) == 1:
-                    # Siril does not expose a one-frame FITS file as a normal
-                    # sequence, so calibrate the image directly. There is no
-                    # registration, drizzle or rejection to perform on a
-                    # single frame; the calibrated image becomes this group's
-                    # integrated result and will be registered with the other
-                    # group results in the final merge.
-                    single_input = os.path.join(group_dir, "light_000001.fit")
-                    single_output = os.path.join(group_dir, "cal_light_000001.fit")
-
-                    siril.log(
-                        f"Calibrating single frame for {tag}...",
-                        s.LogColor.GREEN,
-                    )
-                    run(
-                        siril,
-                        "calibrate_single",
-                        "light_000001.fit",
-                        "-dark=master_dark.fits",
-                        "-flat=master_flat.fits",
-                        "-cfa",
-                        "-debayer",
-                        "-prefix=cal_",
-                    )
-
-                    if not os.path.exists(single_output):
-                        raise RuntimeError(
-                            f"Expected calibrated single frame was not created: "
-                            f"{single_output}"
-                        )
-
-                    group_result = single_output
-                    stack_results.append(group_result)
-                    continue
-
                 run(
                     siril,
-                    "calibrate",
-                    "light_",
+                    "calibrate_single",
+                    "light_000001.fit",
                     "-dark=master_dark.fits",
                     "-flat=master_flat.fits",
                     "-cfa",
-                    "-fitseq",
+                    "-debayer",
                     "-prefix=cal_",
                 )
 
-                # Register and drizzle this exposure/gain/filter group
-                # independently. This keeps frames with different exposure
-                # lengths out of the same registration/stacking population.
-                siril.log(
-                    f"Registering sequence for {tag}...",
-                    s.LogColor.GREEN,
-                )
-                run(siril, "register", "cal_light_", "-2pass")
-
-                siril.log(
-                    f"Applying drizzle to {tag} ({drizzle_scale:g}x)...",
-                    s.LogColor.GREEN,
-                )
-                run(
-                    siril,
-                    "seqapplyreg",
-                    "cal_light_",
-                    "-drizzle",
-                    f"-scale={drizzle_scale:g}",
-                    f"-pixfrac={pixel_fraction:.2f}",
-                    f"-kernel={DRIZZLE_KERNEL}",
-                )
-
-                stack = [
-                    "stack",
-                    "r_cal_light_",
-                    "rej",
-                    f"{sigma_low:g}",
-                    f"{sigma_high:g}",
-                    "-norm=addscale",
-                    "-maximize",
-                    "-32b",
-                ]
-
-                if USE_WEIGHTED_FWHM:
-                    stack.append("-weight=wfwhm")
-
-                stack.extend(
-                    filter_args(
-                        filter_fwhm,
-                        filter_round,
-                        filter_background,
-                        filter_star_count,
-                        wfwhm_percent,
-                    )
-                )
-                stack.append(f"-out={group_result_name}")
-
-                siril.log(
-                    f"Stacking {tag}...",
-                    s.LogColor.GREEN,
-                )
-                run(siril, *stack)
-
-                group_result = os.path.join(
-                    group_dir,
-                    f"{group_result_name}.fit",
-                )
-
-                if not os.path.exists(group_result):
+                if not os.path.exists(single_output):
                     raise RuntimeError(
-                        f"Expected group stack was not created: {group_result}"
+                        f"Expected calibrated single frame was not created: "
+                        f"{single_output}"
                     )
 
-            stack_results.append(group_result)
+                stack_results[filter_id].append(single_output)
+                continue
 
-        if not stack_results:
-            raise RuntimeError("No exposure-group stacks were produced.")
-
-        # If there is only one exposure/gain/filter group, its stack is already
-        # the final result. Otherwise, make an ordinary FITS-image sequence
-        # from the group stacks, register it, apply those transforms, and then
-        # combine the registered group images.
-        #
-        # Do NOT use -fitseq here. A FITS sequence in Siril is a set of files
-        # named basename_00001.fit, basename_00002.fit, etc. -fitseq creates a
-        # single FITS cube, which is not what we want for this second-stage
-        # registration.
-        if len(stack_results) == 1:
-            source_result = stack_results[0]
-        else:
-            run(siril, "cd", merged_dir)
-
-            # Remove anything left by a previous failed run.
-            for name in os.listdir(merged_dir):
-                path = os.path.join(merged_dir, name)
-                if os.path.isfile(path) and (
-                    name.startswith("group_") or
-                    name.startswith("r_group_") or
-                    name.startswith("group_" + result_name)
-                ):
-                    remove(path)
-
-            # Create a normal Siril FITS sequence. The naming pattern is what
-            # makes group_ the sequence name.
-            for index, stack_result in enumerate(stack_results, 1):
-                target = os.path.join(
-                    merged_dir,
-                    f"group_{index:05d}.fit",
-                )
-                shutil.copy2(stack_result, target)
+            # Keep the Bayer CFA data intact for Bayer drizzle. Siril's drizzle
+            # workflow requires color-camera inputs to remain undebayered.
+            run(
+                siril,
+                "calibrate",
+                "light_",
+                "-dark=master_dark.fits",
+                "-flat=master_flat.fits",
+                "-cfa",
+                "-fitseq",
+                "-prefix=cal_",
+            )
 
             siril.log(
-                f"Registering {len(stack_results)} independent exposure "
-                f"group stacks together...",
+                f"Registering sequence for {tag}...",
                 s.LogColor.GREEN,
             )
-            run(siril, "register", "group_", "-2pass")
+            run(siril, "register", "cal_light_", "-2pass")
 
-            # register -2pass only calculates the transforms. seqapplyreg is
-            # required to actually create r_group_*.fit.
+            siril.log(
+                f"Applying drizzle to {tag} ({drizzle_scale:g}x)...",
+                s.LogColor.GREEN,
+            )
             run(
                 siril,
                 "seqapplyreg",
-                "group_",
-                "-framing=max",
+                "cal_light_",
+                "-drizzle",
+                f"-scale={drizzle_scale:g}",
+                f"-pixfrac={pixel_fraction:.2f}",
+                f"-kernel={DRIZZLE_KERNEL}",
             )
 
-            siril.log(
-                "Combining independently stacked exposure groups...",
-                s.LogColor.GREEN,
-            )
-
-            # There is no useful sigma rejection to perform here: these are
-            # already integrated group images, not individual light frames.
-            # Use mean stacking with no rejection. nbstack weights each group
-            # by the number of source frames represented by that group.
-            # This preserves the benefit of having more source frames in a
-            # group without pretending the individual exposure lengths were
-            # interchangeable during the original rejection stage.
-            final_stack = [
+            stack = [
                 "stack",
-                "r_group_",
-                "mean",
-                "none",
+                "r_cal_light_",
+                "rej",
+                f"{sigma_low:g}",
+                f"{sigma_high:g}",
                 "-norm=addscale",
                 "-maximize",
-                "-output_norm",
                 "-32b",
-                f"-out={result_name}",
             ]
 
-            run(siril, *final_stack)
+            if USE_WEIGHTED_FWHM:
+                stack.append("-weight=wfwhm")
 
-            source_result = os.path.join(
-                merged_dir,
-                f"{result_name}.fit",
+            stack.extend(
+                filter_args(
+                    filter_fwhm,
+                    wfwhm_percent,
+                    filter_round,
+                    filter_background,
+                    filter_star_count,
+                )
+            )
+            stack.append(f"-out={group_result_name}")
+
+            siril.log(
+                f"Stacking {tag}...",
+                s.LogColor.GREEN,
+            )
+            run(siril, *stack)
+
+            group_result = os.path.join(
+                group_dir,
+                f"{group_result_name}.fit",
             )
 
-        root_result = os.path.join(
-            root,
-            f"{result_name}.fit",
-        )
+            if not os.path.exists(group_result):
+                raise RuntimeError(
+                    f"Expected group stack was not created: {group_result}"
+                )
 
-        if os.path.exists(source_result):
+            stack_results[filter_id].append(group_result)
+
+        if not any(stack_results.values()):
+            raise RuntimeError("No exposure-group stacks were produced.")
+
+        # Merge Astro and Duo-Band separately. Each group is already integrated,
+        # so the second stage uses a mean with nbstack weighting rather than
+        # another rejection pass.
+        output_results = {}
+
+        for filter_id, filter_label in (("1", "astro"), ("2", "duoband")):
+            results = stack_results[filter_id]
+            if not results:
+                continue
+
+            if len(results) == 1:
+                source_result = results[0]
+            else:
+                filter_merged_dir = os.path.join(merged_dir, filter_label)
+                remove(filter_merged_dir)
+                os.makedirs(filter_merged_dir, exist_ok=True)
+
+                run(siril, "cd", filter_merged_dir)
+
+                for index, stack_result in enumerate(results, 1):
+                    target = os.path.join(
+                        filter_merged_dir,
+                        f"group_{index:05d}.fit",
+                    )
+                    shutil.copy2(stack_result, target)
+
+                siril.log(
+                    f"Registering {len(results)} {filter_label} group stacks...",
+                    s.LogColor.GREEN,
+                )
+                run(siril, "register", "group_", "-2pass")
+                run(
+                    siril,
+                    "seqapplyreg",
+                    "group_",
+                    "-framing=max",
+                )
+
+                filter_result_name = f"{result_name}_{filter_label}"
+                final_stack = [
+                    "stack",
+                    "r_group_",
+                    "mean",
+                    "none",
+                    "-norm=addscale",
+                    "-maximize",
+                    "-output_norm",
+                    "-32b",
+                    "-weight=nbstack",
+                    f"-out={filter_result_name}",
+                ]
+                run(siril, *final_stack)
+
+                source_result = os.path.join(
+                    filter_merged_dir,
+                    f"{filter_result_name}.fit",
+                )
+
+            root_result = os.path.join(
+                root,
+                f"{result_name}_{filter_label}.fit",
+            )
             shutil.copy2(source_result, root_result)
+            output_results[filter_label] = root_result
 
         run(siril, "cd", root)
-        run(siril, "load", result_name)
+
+        # Load the first available result so the script leaves Siril showing
+        # a useful output. Both filter-specific files remain on disk.
+        first_label = next(iter(output_results))
+        run(
+            siril,
+            "load",
+            os.path.splitext(os.path.basename(output_results[first_label]))[0],
+        )
 
         siril.log("==============================================", s.LogColor.GREEN)
         siril.log("Dwarf Mini multi-night stack COMPLETE", s.LogColor.GREEN)
-        siril.log(f"Result: {root_result}", s.LogColor.GREEN)
+        for label, path in output_results.items():
+            siril.log(f"Result ({label}): {path}", s.LogColor.GREEN)
         siril.log(f"Lights: {len(lights)}", s.LogColor.GREEN)
         siril.log(f"Calibration groups: {len(groups)}", s.LogColor.GREEN)
         siril.log(
@@ -632,24 +593,23 @@ def main():
 
         siril.log("----------------------------------------------", s.LogColor.BLUE)
         siril.log("Dark used for each light group:", s.LogColor.BLUE)
-        for date, key, count, dark in dark_usage:
+        for key, count, dark in dark_usage:
             temperature, exposure, gain, filter_id = key
             siril.log(
-                f"  {date} | {exposure:g}s gain {gain:g} {temperature:.1f}C ir_{filter_id} "
+                f"  {exposure:g}s gain {gain:g} {temperature:.1f}C ir_{filter_id} "
                 f"({count} lights) -> {os.path.basename(dark['path'])}",
                 s.LogColor.BLUE,
             )
-        frame_filters = filter_args(
+        filter_settings = filter_args(
             filter_fwhm,
+            wfwhm_percent,
             filter_round,
             filter_background,
             filter_star_count,
-            wfwhm_percent,
         )
-
         siril.log(
             "Frame filtering: "
-            + (" ".join(frame_filters) if frame_filters else "none"),
+            + (" ".join(filter_settings) if filter_settings else "none"),
             s.LogColor.GREEN,
         )
 
