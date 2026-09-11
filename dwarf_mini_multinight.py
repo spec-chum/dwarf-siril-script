@@ -14,10 +14,6 @@ DRIZZLE_KERNEL = "square"
 
 
 # Percentage of best frames to keep. 100 disables a filter.
-FILTER_FWHM = 100
-FILTER_ROUND = 100
-FILTER_BACKGROUND = 100
-FILTER_STAR_COUNT = 100
 
 USE_WEIGHTED_FWHM = True
 DARK_TEMP_WARNING_C = 5.0
@@ -98,15 +94,17 @@ def choose_dark(darks, exposure, gain, temperature):
     candidates = [
         dark
         for dark in darks
-        if abs(dark["exposure"] - exposure) < 0.001
-        and abs(dark["gain"] - gain) < 0.001
-        and abs(dark["temperature"] - temperature) < 0.001
+        if dark["exposure"] == exposure
+        and dark["gain"] == gain
     ]
 
     if not candidates:
         return None
 
-    return max(candidates, key=lambda dark: dark["stack_count"])
+    return min(
+        candidates,
+        key=lambda dark: abs(dark["temperature"] - temperature),
+    )
 
 
 # ---------------------------- helpers -------------------------------------
@@ -142,19 +140,25 @@ def copy_as_sequence(files, destination):
         shutil.copy2(source, target)
 
 
-def filter_args(wfwhm_percent=100.0):
+def filter_args(
+    filter_fwhm=100.0,
+    filter_round=100.0,
+    filter_background=100.0,
+    filter_star_count=100.0,
+    wfwhm_percent=100.0,
+):
     args = []
 
-    if FILTER_FWHM < 100:
-        args.append(f"-filter-fwhm={FILTER_FWHM}%")
+    if filter_fwhm < 100:
+        args.append(f"-filter-fwhm={filter_fwhm}%")
     if wfwhm_percent < 100:
         args.append(f"-filter-wfwhm={wfwhm_percent}%")
-    if FILTER_ROUND < 100:
-        args.append(f"-filter-round={FILTER_ROUND}%")
-    if FILTER_BACKGROUND < 100:
-        args.append(f"-filter-bkg={FILTER_BACKGROUND}%")
-    if FILTER_STAR_COUNT < 100:
-        args.append(f"-filter-nbstars={FILTER_STAR_COUNT}%")
+    if filter_round < 100:
+        args.append(f"-filter-round={filter_round}%")
+    if filter_background < 100:
+        args.append(f"-filter-bkg={filter_background}%")
+    if filter_star_count < 100:
+        args.append(f"-filter-nbstars={filter_star_count}%")
 
     return args
 
@@ -185,6 +189,18 @@ def main():
         )
         wfwhm_percent = config.getfloat(
             "processing", "wfwhm_percent", fallback=100.0
+        )
+        filter_fwhm = config.getfloat(
+            "processing", "filter_fwhm", fallback=100.0
+        )
+        filter_round = config.getfloat(
+            "processing", "filter_round", fallback=100.0
+        )
+        filter_background = config.getfloat(
+            "processing", "filter_background", fallback=100.0
+        )
+        filter_star_count = config.getfloat(
+            "processing", "filter_star_count", fallback=100.0
         )
         sigma_low = config.getfloat(
             "processing", "sigma_low", fallback=3.0
@@ -481,7 +497,15 @@ def main():
                 if USE_WEIGHTED_FWHM:
                     stack.append("-weight=wfwhm")
 
-                stack.extend(filter_args(wfwhm_percent))
+                stack.extend(
+                    filter_args(
+                        filter_fwhm,
+                        filter_round,
+                        filter_background,
+                        filter_star_count,
+                        wfwhm_percent,
+                    )
+                )
                 stack.append(f"-out={group_result_name}")
 
                 siril.log(
@@ -615,9 +639,17 @@ def main():
                 f"({count} lights) -> {os.path.basename(dark['path'])}",
                 s.LogColor.BLUE,
             )
+        frame_filters = filter_args(
+            filter_fwhm,
+            filter_round,
+            filter_background,
+            filter_star_count,
+            wfwhm_percent,
+        )
+
         siril.log(
             "Frame filtering: "
-            + (" ".join(filter_args(wfwhm_percent)) if filter_args(wfwhm_percent) else "none"),
+            + (" ".join(frame_filters) if frame_filters else "none"),
             s.LogColor.GREEN,
         )
 
