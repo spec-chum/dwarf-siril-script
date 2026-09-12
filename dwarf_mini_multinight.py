@@ -215,6 +215,9 @@ def main():
         keep_intermediates = config.getboolean(
             "processing", "keep_intermediates", fallback=False
         )
+        align_filters = config.getboolean(
+            "processing", "align_filters", fallback=True
+        )
         result_name = config.get(
             "processing", "result_name", fallback="result"
         )
@@ -233,6 +236,7 @@ def main():
             f"pixfrac {pixel_fraction:.2f} | WFWHM {wfwhm_percent:g}% | "
             f"sigma {sigma_low:g}/{sigma_high:g} | "
             f"keep intermediates {keep_intermediates} | "
+            f"align filters {align_filters} | "
             f"result {result_name}",
             s.LogColor.BLUE,
         )
@@ -570,6 +574,40 @@ def main():
             output_results[filter_label] = root_result
 
         run(siril, "cd", root)
+
+        # If both filter results exist, optionally register them against each
+        # other and use common framing so their pixels line up exactly.
+        if align_filters and len(output_results) == 2:
+            align_dir = os.path.join(merged_dir, "align_filters")
+            remove(align_dir)
+            os.makedirs(align_dir, exist_ok=True)
+            run(siril, "cd", align_dir)
+
+            astro_path = output_results["astro"]
+            duoband_path = output_results["duoband"]
+            shutil.copy2(astro_path, os.path.join(align_dir, "group_00001.fit"))
+            shutil.copy2(duoband_path, os.path.join(align_dir, "group_00002.fit"))
+
+            siril.log(
+                "Aligning Astro and Duo-Band results...",
+                s.LogColor.GREEN,
+            )
+            run(siril, "register", "group_", "-2pass")
+            run(siril, "seqapplyreg", "group_", "-framing=min")
+
+            aligned_astro = os.path.join(align_dir, "r_group_00001.fit")
+            aligned_duoband = os.path.join(align_dir, "r_group_00002.fit")
+
+            if not os.path.exists(aligned_astro) or not os.path.exists(aligned_duoband):
+                raise RuntimeError("Filter alignment did not produce both aligned results.")
+
+            shutil.copy2(aligned_astro, astro_path)
+            shutil.copy2(aligned_duoband, duoband_path)
+            run(siril, "cd", root)
+            siril.log(
+                "Astro and Duo-Band results aligned to common framing.",
+                s.LogColor.GREEN,
+            )
 
         # Load the first available result so the script leaves Siril showing
         # a useful output. Both filter-specific files remain on disk.

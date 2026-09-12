@@ -34,11 +34,15 @@ Only the filter types actually present in the data are produced.
 
 ## Setup
 
-The script expects the Dwarf's lights to be available in a folder in the Siril working directory called:
+The script expects a lights/ folder inside the Siril working directory:
 
-    lights/
+Siril working directory/
+└── lights/
+    ├── light1.fits
+    ├── light2.fits
+    └── ...
 
-Put all the `.fits` files in there from every night you want to process. You don't need to sort them.
+Put all the `.fits` files in there from every night you want to process, even the failed files if you want. You don't need to sort them.
 
 Master calibration frames are read directly from the Dwarf's filesystem, either from a local copy or the device itself:
 
@@ -60,6 +64,7 @@ Processing options can be set in an optional `config.ini` in the Siril working d
     sigma_low = 3.0
     sigma_high = 3.0
     keep_intermediates = false
+    align_filters = true
     result_name = result
 
 If `config.ini` is not present, or any of the values are missing, the script uses its built-in defaults.
@@ -73,3 +78,5 @@ Dark matching is strict for **exposure and gain**. Temperature does not need to 
 The `process/` folder is deleted and recreated at the start of each run. **Do not store anything in this folder that you want to keep.**
 
 Intermediate processing files can be retained with `keep_intermediates = true` for troubleshooting or inspection.
+
+When both Astro and Duo-Band results are produced, `align_filters = true` registers them against each other and uses common framing so the two final images are pixel-aligned. Set it to `false` to leave the two results independently framed.
