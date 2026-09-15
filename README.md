@@ -56,15 +56,19 @@ Processing options can be set in an optional `config.ini` in the Siril working d
     [processing]
     drizzle_scale = 1.0
     pixel_fraction = 1.0
-    wfwhm_percent = 100.0
-    filter_fwhm = 100.0
+
+    use_weighted_fwhm = true
+
+    filter_wfwhm = 100.0
     filter_round = 100.0
     filter_background = 100.0
     filter_star_count = 100.0
     sigma_low = 3.0
     sigma_high = 3.0
-    keep_intermediates = false
+
     align_filters = true
+
+    keep_intermediates = false
     result_name = result
 
 If `config.ini` is not present, or any of the values are missing, the script uses its built-in defaults.
