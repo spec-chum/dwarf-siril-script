@@ -211,13 +211,12 @@ def main():
         keep_intermediates = config.getboolean(
             "processing", "keep_intermediates", fallback=False
         )
-        align_filters = config.getboolean(
+        align_results = config.getboolean(
             "processing", "align_filters", fallback=True
         )
         result_name = config.get(
             "processing", "result_name", fallback="result"
         )
-
 
         base_dir = root
 
@@ -234,7 +233,7 @@ def main():
             f"pixfrac {pixel_fraction:.2f} | WFWHM {filter_wfwhm:g}% | "
             f"sigma {sigma_low:g}/{sigma_high:g} | "
             f"keep intermediates {keep_intermediates} | "
-            f"align filters {align_filters} | "
+            f"align results {align_results} | "
             f"result {result_name}",
             s.LogColor.BLUE,
         )
@@ -326,18 +325,29 @@ def main():
         os.makedirs(merged_dir, exist_ok=True)
 
         # Calibration is grouped because each temperature/exposure/gain/filter
-        # combination may need a different master dark. Once calibrated, the
-        # individual lights no longer need to remain separated by calibration
-        # group. Collect all calibrated lights for each filter into one
-        # sequence, then register and stack that complete sequence once.
+        # combination may need a different master dark. Once calibrated, merge
+        # groups only when their filter and exposure match. Different exposure
+        # lengths must be stacked separately because saturated stars cannot be
+        # normalized reliably against unsaturated stars during rejection.
         combined_dirs = {}
-        calibrated_sequences = {"1": [], "2": []}
+        calibrated_sequences = defaultdict(list)
         sequence_counts = {}
-        for filter_id, filter_label in (("1", "astro"), ("2", "duoband")):
-            combined_dir = os.path.join(merged_dir, filter_label, "calibrated")
+
+        filter_labels = {"1": "astro", "2": "duoband"}
+        for _, exposure, _, filter_id in groups:
+            stack_key = (filter_id, exposure)
+            if stack_key in combined_dirs:
+                continue
+
+            combined_dir = os.path.join(
+                merged_dir,
+                filter_labels[filter_id],
+                f"{exposure:g}s",
+                "calibrated",
+            )
             remove(combined_dir)
             os.makedirs(combined_dir, exist_ok=True)
-            combined_dirs[filter_id] = combined_dir
+            combined_dirs[stack_key] = combined_dir
 
         group_number = 0
 
@@ -458,51 +468,71 @@ def main():
                 run(siril, "convert", "cal_light_", "-fitseq")
                 cal_seq = os.path.join(single_dir, "cal_light_")
 
-            # The .seq file is Siril's canonical sequence descriptor.
-            # Do not assume a particular FITS storage layout.
-            if not os.path.isfile(cal_seq + ".seq"):
-                raise RuntimeError(
-                    f"Expected calibrated sequence was not created: {cal_seq}.seq"
-                )
-
-            calibrated_sequences[filter_id].append(cal_seq)
+            stack_key = (filter_id, exposure)
+            calibrated_sequences[stack_key].append(cal_seq)
             sequence_counts[cal_seq] = len(group)
 
         if not any(calibrated_sequences.values()):
             raise RuntimeError("No calibrated light sequences were produced.")
 
-        # Merge the calibrated sequences for each filter. Calibration remains
-        # grouped because each group may need a different dark; after that, the
-        # individual calibrated frames are registered and stacked together.
+        # Merge calibrated sequences only within a matching filter/exposure
+        # pair. Calibration groups at different temperatures or gains may still
+        # share a stack once they have been calibrated with their own darks.
         output_results = {}
+        stack_livetimes = {}
 
-        for filter_id, filter_label in (("1", "astro"), ("2", "duoband")):
-            seqs = calibrated_sequences[filter_id]
-            if not seqs:
-                continue
-
-            combined_dir = combined_dirs[filter_id]
+        for stack_key in sorted(
+            calibrated_sequences,
+            key=lambda item: (item[0], item[1]),
+        ):
+            filter_id, exposure = stack_key
+            filter_label = filter_labels[filter_id]
+            seqs = calibrated_sequences[stack_key]
+            combined_dir = combined_dirs[stack_key]
             run(siril, "cd", combined_dir)
             count = sum(sequence_counts[seq] for seq in seqs)
 
+            combined_seq = "combined_"
+
             if len(seqs) == 1:
-                combined_seq = seqs[0]
                 siril.log(
-                    f"Using single calibrated {filter_label} sequence "
+                    f"Using single calibrated {filter_label} {exposure:g}s sequence "
                     f"({count} individual lights)...",
                     s.LogColor.GREEN,
+                )
+
+                source_base = seqs[0]
+                source_file = None
+
+                for extension in (".fit", ".fits"):
+                    candidate = source_base + extension
+                    if os.path.isfile(candidate):
+                        source_file = candidate
+                        break
+
+                if source_file is None:
+                    raise RuntimeError(
+                        f"Calibrated FITS sequence file was not found: {source_base}"
+                    )
+
+                shutil.copy2(
+                    source_file,
+                    os.path.join(
+                        combined_dir,
+                        combined_seq + os.path.splitext(source_file)[1],
+                    ),
                 )
             else:
                 siril.log(
-                    f"Merging {len(seqs)} calibrated {filter_label} sequences "
-                    f"({count} individual lights)...",
+                    f"Combining {len(seqs)} calibrated {filter_label} "
+                    f"{exposure:g}s sequences...",
                     s.LogColor.GREEN,
                 )
-                run(siril, "merge", *seqs, "combined_")
-                combined_seq = os.path.join(combined_dir, "combined_")
+                run(siril, "merge", *seqs, combined_seq)
 
             siril.log(
-                f"Registering + drizzling all {count} {filter_label} calibrated lights "
+                f"Registering + drizzling all {count} {filter_label} "
+                f"{exposure:g}s calibrated lights "
                 f"({drizzle_scale:g}x)...",
                 s.LogColor.GREEN,
             )
@@ -511,10 +541,7 @@ def main():
                 "-minpairs=10", "-maxstars=2000", "-drizzle",
                 f"-pixfrac={pixel_fraction:.2f}", f"-kernel={DRIZZLE_KERNEL}")
 
-            registered_seq = os.path.join(
-                os.path.dirname(combined_seq),
-                "r_" + os.path.basename(combined_seq)
-            )
+            registered_seq = "r_" + combined_seq
             stack = ["stack", registered_seq, "rej", "winsorized",
                      f"{sigma_low:g}", f"{sigma_high:g}",
                      "-norm=addscale", "-output_norm", "-32b"]
@@ -522,65 +549,200 @@ def main():
                 stack.append("-weight=wfwhm")
             stack.extend(filter_args(filter_wfwhm, filter_round,
                                      filter_background, filter_star_count))
-            filter_result_name = f"{result_name}_{filter_label}"
+            filter_result_name = (
+                f"{result_name}_{filter_label}_{exposure:g}s"
+            )
             stack.append(f"-out={filter_result_name}")
-            siril.log(f"Stacking all {count} calibrated {filter_label} lights...", s.LogColor.GREEN)
+            siril.log(
+                f"Stacking all {count} calibrated {filter_label} "
+                f"{exposure:g}s lights...",
+                s.LogColor.GREEN,
+            )
             run(siril, *stack)
             # Keep the finished result outside work_dir so cleanup cannot delete it.
             stacked_path = os.path.join(combined_dir, f"{filter_result_name}.fit")
             final_path = os.path.join(root, f"{filter_result_name}.fit")
             if not os.path.exists(stacked_path):
                 raise RuntimeError(f"Stack completed but output file was not found: {stacked_path}")
-            shutil.copy2(stacked_path, final_path)
-            output_results[filter_id] = final_path
 
-        # If both filter results exist, optionally register them against each
-        # other and use common framing so their pixels line up exactly.
-        if align_filters and len(output_results) == 2:
-            align_dir = os.path.join(merged_dir, "align_filters")
+            # Siril writes the actual integration represented by the stack to
+            # LIVETIME. This accounts for frames excluded by stack filtering.
+            run(siril, "load", filter_result_name)
+            header = siril.get_image_fits_header(return_as="dict") or {}
+            try:
+                livetime = float(header.get("LIVETIME", count * exposure))
+            except (TypeError, ValueError):
+                livetime = count * exposure
+            if livetime <= 0:
+                livetime = count * exposure
+
+            shutil.copy2(stacked_path, final_path)
+            output_results[stack_key] = final_path
+            stack_livetimes[stack_key] = livetime
+
+        # Register every completed filter/exposure stack together so all final
+        # results have identical geometry and can be blended directly.
+        if align_results and len(output_results) > 1:
+            align_dir = os.path.join(merged_dir, "align_results")
             remove(align_dir)
             os.makedirs(align_dir, exist_ok=True)
             run(siril, "cd", align_dir)
 
-            astro_path = output_results["1"]
-            duoband_path = output_results["2"]
-            shutil.copy2(astro_path, os.path.join(align_dir, "group_00001.fit"))
-            shutil.copy2(duoband_path, os.path.join(align_dir, "group_00002.fit"))
+            aligned_results = sorted(
+                output_results.items(),
+                key=lambda item: (item[0][0], item[0][1]),
+            )
+            for index, (_, result_path) in enumerate(aligned_results, 1):
+                shutil.copy2(
+                    result_path,
+                    os.path.join(align_dir, f"group_{index:05d}.fit"),
+                )
 
             siril.log(
-                "Aligning Astro and Duo-Band results...",
+                f"Aligning all {len(aligned_results)} filter/exposure results...",
                 s.LogColor.GREEN,
             )
             run(siril, "register", "group_", "-2pass")
             run(siril, "seqapplyreg", "group_", "-framing=min")
 
-            aligned_astro = os.path.join(align_dir, "r_group_00001.fit")
-            aligned_duoband = os.path.join(align_dir, "r_group_00002.fit")
+            for index, (_, result_path) in enumerate(aligned_results, 1):
+                aligned_path = os.path.join(
+                    align_dir,
+                    f"r_group_{index:05d}.fit",
+                )
+                if not os.path.exists(aligned_path):
+                    raise RuntimeError(
+                        "Result alignment did not produce every aligned image."
+                    )
+                shutil.copy2(aligned_path, result_path)
 
-            if not os.path.exists(aligned_astro) or not os.path.exists(aligned_duoband):
-                raise RuntimeError("Filter alignment did not produce both aligned results.")
-
-            shutil.copy2(aligned_astro, astro_path)
-            shutil.copy2(aligned_duoband, duoband_path)
             run(siril, "cd", root)
             siril.log(
-                "Astro and Duo-Band results aligned to common framing.",
+                "All filter/exposure results aligned to common framing.",
                 s.LogColor.GREEN,
             )
 
+        # Linear-match the aligned exposure masters to the shortest exposure,
+        # then average them with weights based on their actual total integration
+        # times. This avoids running pixel rejection across incompatible star
+        # profiles while still producing one combined result per filter.
+        combined_results = {}
+        for filter_id, filter_label in filter_labels.items():
+            filter_stacks = sorted(
+                (
+                    (stack_key, result_path)
+                    for stack_key, result_path in output_results.items()
+                    if stack_key[0] == filter_id
+                ),
+                key=lambda item: item[0][1],
+            )
+            if len(filter_stacks) < 2:
+                continue
+            if not align_results:
+                siril.log(
+                    f"Skipping {filter_label} exposure blend because "
+                    "align_filters is disabled.",
+                    s.LogColor.SALMON,
+                )
+                continue
+            if len(filter_stacks) > 10:
+                raise RuntimeError(
+                    "Cannot blend more than 10 exposure stacks with Siril PixelMath."
+                )
+
+            blend_dir = os.path.join(merged_dir, "blend_exposures", filter_label)
+            remove(blend_dir)
+            os.makedirs(blend_dir, exist_ok=True)
+            run(siril, "cd", blend_dir)
+
+            blend_inputs = []
+            reference_name = "blend_00001"
+            for index, (stack_key, result_path) in enumerate(filter_stacks, 1):
+                source_name = f"blend_{index:05d}"
+                shutil.copy2(
+                    result_path,
+                    os.path.join(blend_dir, source_name + ".fit"),
+                )
+
+                if index == 1:
+                    blend_name = source_name
+                else:
+                    blend_name = f"matched_{index:05d}"
+                    run(siril, "load", source_name)
+                    run(
+                        siril,
+                        "linear_match",
+                        reference_name,
+                        "0.001",
+                        "0.92",
+                    )
+                    run(siril, "save", blend_name)
+
+                blend_inputs.append(
+                    (blend_name, stack_livetimes[stack_key])
+                )
+
+            total_livetime = sum(weight for _, weight in blend_inputs)
+            expression = " + ".join(
+                f"${name}$ * {weight:.12g}"
+                for name, weight in blend_inputs
+            )
+            expression = f"({expression}) / {total_livetime:.12g}"
+
+            combined_name = f"{result_name}_{filter_label}"
+            siril.log(
+                f"Blending {len(blend_inputs)} {filter_label} exposure stacks "
+                f"using {total_livetime:g}s total integration...",
+                s.LogColor.GREEN,
+            )
+            for (stack_key, _), (_, weight) in zip(
+                filter_stacks,
+                blend_inputs,
+            ):
+                siril.log(
+                    f"  {stack_key[1]:g}s stack weight: {weight:g}s",
+                    s.LogColor.GREEN,
+                )
+
+            run(siril, "set32bits")
+            run(siril, "pm", f'"{expression}"')
+            run(siril, "save", combined_name)
+
+            blended_path = os.path.join(blend_dir, combined_name + ".fit")
+            final_blended_path = os.path.join(root, combined_name + ".fit")
+            if not os.path.exists(blended_path):
+                raise RuntimeError(
+                    f"Exposure blend was not created: {blended_path}"
+                )
+            shutil.copy2(blended_path, final_blended_path)
+            combined_results[filter_id] = final_blended_path
+
         # Load the first available result so the script leaves Siril showing
-        # a useful output. Both filter-specific files remain on disk.
-        first_label = next(iter(output_results))
+        # a useful output. Prefer a combined exposure result when available.
+        run(siril, "cd", root)
+        display_path = (
+            next(iter(combined_results.values()))
+            if combined_results
+            else next(iter(output_results.values()))
+        )
         run(
             siril,
             "load",
-            os.path.splitext(os.path.basename(output_results[first_label]))[0],
+            os.path.splitext(os.path.basename(display_path))[0],
         )
 
         siril.log("==============================================", s.LogColor.GREEN)
         siril.log("Dwarf Mini multi-night stack COMPLETE", s.LogColor.GREEN)
-        for label, path in output_results.items():
-            siril.log(f"Result ({label}): {path}", s.LogColor.GREEN)
+        for (filter_id, exposure), path in output_results.items():
+            siril.log(
+                f"Result ({filter_labels[filter_id]}, {exposure:g}s): {path}",
+                s.LogColor.GREEN,
+            )
+        for filter_id, path in combined_results.items():
+            siril.log(
+                f"Combined result ({filter_labels[filter_id]}): {path}",
+                s.LogColor.GREEN,
+            )
         siril.log(f"Lights: {len(lights)}", s.LogColor.GREEN)
         siril.log(f"Calibration groups: {len(groups)}", s.LogColor.GREEN)
         siril.log(
