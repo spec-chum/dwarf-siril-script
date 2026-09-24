@@ -1,4 +1,5 @@
 import configparser
+import math
 import os
 import re
 import shutil
@@ -161,6 +162,32 @@ def filter_args(
         args.append(f"-filter-nbstars={filter_star_count}%")
 
     return args
+
+
+def measure_image_noise(siril):
+    """Return one background-noise estimate for the currently loaded image."""
+    image = siril.get_image(with_pixels=True)
+    if image is None or image.data is None or image.channels < 1:
+        raise RuntimeError("Cannot retrieve pixel data from the loaded master.")
+
+    channel_noises = []
+    for channel in range(image.channels):
+        # Compute directly from the pixels rather than requesting Siril's
+        # cached image statistics: immediately after LOAD in Siril 1.4 those
+        # cached fields can still be zero. The estimator sigma-clips
+        # first-order pixel differences, limiting contamination by structure.
+        noise = float(image.estimate_noise(image.get_channel(channel)))
+        if math.isfinite(noise) and noise > 0:
+            channel_noises.append(noise)
+
+    if not channel_noises:
+        raise RuntimeError("Could not measure positive noise in the loaded master.")
+
+    # Use a single scalar weight for the RGB image while accounting for noise
+    # in every channel. For mono images this reduces to that channel's noise.
+    return math.sqrt(
+        sum(noise * noise for noise in channel_noises) / len(channel_noises)
+    )
 
 
 # ---------------------------- main ----------------------------------------
@@ -623,9 +650,10 @@ def main():
             )
 
         # Linear-match the aligned exposure masters to the shortest exposure,
-        # then average them with weights based on their actual total integration
-        # times. This avoids running pixel rejection across incompatible star
-        # profiles while still producing one combined result per filter.
+        # then average them using inverse-variance weights measured from the
+        # matched masters. The measured master noise already reflects total
+        # integration time, accepted-frame count and within-stack weighting, so
+        # multiplying by LIVETIME again would count integration time twice.
         combined_results = {}
         for filter_id, filter_label in filter_labels.items():
             filter_stacks = sorted(
@@ -664,11 +692,11 @@ def main():
                     os.path.join(blend_dir, source_name + ".fit"),
                 )
 
+                run(siril, "load", source_name)
                 if index == 1:
                     blend_name = source_name
                 else:
                     blend_name = f"matched_{index:05d}"
-                    run(siril, "load", source_name)
                     run(
                         siril,
                         "linear_match",
@@ -678,29 +706,30 @@ def main():
                     )
                     run(siril, "save", blend_name)
 
-                blend_inputs.append(
-                    (blend_name, stack_livetimes[stack_key])
-                )
+                noise = measure_image_noise(siril)
+                blend_inputs.append((blend_name, 1.0 / (noise * noise), noise))
 
-            total_livetime = sum(weight for _, weight in blend_inputs)
+            total_weight = sum(weight for _, weight, _ in blend_inputs)
             expression = " + ".join(
                 f"${name}$ * {weight:.12g}"
-                for name, weight in blend_inputs
+                for name, weight, _ in blend_inputs
             )
-            expression = f"({expression}) / {total_livetime:.12g}"
+            expression = f"({expression}) / {total_weight:.12g}"
 
             combined_name = f"{result_name}_{filter_label}"
             siril.log(
                 f"Blending {len(blend_inputs)} {filter_label} exposure stacks "
-                f"using {total_livetime:g}s total integration...",
+                "using measured inverse-variance weights...",
                 s.LogColor.GREEN,
             )
-            for (stack_key, _), (_, weight) in zip(
+            for (stack_key, _), (_, weight, noise) in zip(
                 filter_stacks,
                 blend_inputs,
             ):
                 siril.log(
-                    f"  {stack_key[1]:g}s stack weight: {weight:g}s",
+                    f"  {stack_key[1]:g}s master: noise={noise:.6g}, "
+                    f"weight={weight / total_weight:.2%}, "
+                    f"livetime={stack_livetimes[stack_key]:g}s",
                     s.LogColor.GREEN,
                 )
 

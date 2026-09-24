@@ -11,15 +11,33 @@ The script automatically:
 - Finds and groups the Dwarf's light frames by exposure, gain, temperature and filter.
 - Groups matching frames together regardless of which night they were captured.
 - Selects the matching master dark for each exposure and gain, using the closest available temperature.
-- Applies the appropriate master flat for each filter.
-- Calibrates and debayers single frames where necessary.
-- Registers and Bayer-drizzles multi-frame groups independently.
-- Stacks each group with sigma rejection.
-- Registers and combines the resulting groups separately into Astro and Duo-Band final images.
+- Applies the single matching `ir_1` or `ir_2` master flat for each filter.
+- Calibrates with dark subtraction, flat correction, CFA equalization and
+  3-sigma dark-derived cosmetic correction.
+- Keeps calibrated lights as undebayered CFA data until Bayer drizzle.
+- Merges calibrated groups that have the same filter and exposure length.
+- Registers with global homography alignment and Bayer-drizzles using the
+  configured scale and pixel fraction.
+- Stacks with winsorized sigma rejection, additive-with-scaling normalization,
+  optional weighted-FWHM weighting, and optional frame-quality filters.
+- Aligns the completed filter/exposure stacks to common framing.
+- When a filter has multiple exposure lengths, linear-matches them to the
+  shortest-exposure master and combines them while still linear using measured
+  inverse-variance (background-noise) weights.
 
-Different exposure lengths and gains are **not mixed during the initial stacking**, allowing datasets containing, for example, both 30s and 60s exposures or different gains to be processed correctly.
+Different exposure lengths are stacked separately. Different gains are
+calibrated separately with their matching darks, but calibrated frames with the
+same filter and exposure length are subsequently merged into one stack.
 
-The final outputs are:
+Every filter/exposure stack is retained in the Siril working directory, for
+example:
+
+    result_astro_30s.fit
+    result_duoband_30s.fit
+    result_duoband_60s.fit
+
+If a filter has two or more exposure lengths and `align_filters = true`, an
+additional blended result is produced:
 
     result_astro.fit
     result_duoband.fit
@@ -42,7 +60,12 @@ Siril working directory/
     ├── light2.fits
     └── ...
 
-Put all the `.fits` files in there from every night you want to process, even the failed files if you want. You don't need to sort them.
+Put all usable `.fit` or `.fits` light frames from every night in this tree;
+subdirectories are searched recursively, so the files do not need to be sorted
+by night. Filenames must contain the Dwarf exposure, gain, `Astro` or
+`Duo-Band` filter name, capture date, and temperature in the format expected by
+the script. Frames that should not contribute should be removed beforehand or
+excluded with the quality filters below.
 
 Master calibration frames are read directly from the Dwarf's filesystem, either from a local copy or the device itself:
 
@@ -73,14 +96,52 @@ Processing options can be set in an optional `config.ini` in the Siril working d
 
 If `config.ini` is not present, or any of the values are missing, the script uses its built-in defaults.
 
-The final images are written to the Siril working directory using `result_name` and are loaded automatically when processing finishes.
+`drizzle_scale` controls the Bayer-drizzle output scale. `pixel_fraction`
+controls the drizzle drop size; the script uses Siril's square drizzle kernel.
+
+When `use_weighted_fwhm = true`, Siril weights accepted frames by weighted
+FWHM during stacking.
+
+The four `filter_*` settings retain the specified percentage of best registered
+frames for weighted FWHM, roundness, background and star count. A value of
+`100.0` disables that filter, which means the supplied defaults do not reject
+frames by these quality measurements.
+
+`sigma_low` and `sigma_high` are the lower and upper thresholds for winsorized
+sigma rejection.
+
+`align_filters` controls the common alignment of all completed
+filter/exposure masters. It must also be enabled for multiple exposure lengths
+to be blended into a filter-level result.
+
+Final images are written to the Siril working directory using `result_name`.
+On completion, the script loads a blended filter result when one exists;
+otherwise it loads the first filter/exposure result.
+
+Exposure-master blending measures noise after alignment and linear matching,
+then assigns each master a weight proportional to `1 / noise²`. Because this is
+the noise of the completed master, it already reflects its accepted frames,
+within-stack wFWHM weights and total integration time; `LIVETIME` is reported
+but is not multiplied into the weight a second time. Every master receives a
+positive, image-wide contribution. The blend is not an HDR or fixed-opacity
+operation and does not stretch either input.
 
 ## Notes
 
-Dark matching is strict for **exposure and gain**. Temperature does not need to match exactly; the closest available master dark is selected. A warning is issued if the temperature difference exceeds 5°C.
+Dark matching is strict for **exposure and gain**. Temperature does not need to
+match exactly; the closest available master dark is selected, with the
+larger-stack master preferred when temperature differences tie. A warning is
+issued if the temperature difference exceeds 5°C.
+
+Exactly one master flat matching each present filter (`ir_1` for Astro or
+`ir_2` for Duo-Band) must be available. Calibration masters are copied into the
+temporary processing tree and are never modified.
 
 The `process/` folder is deleted and recreated at the start of each run. **Do not store anything in this folder that you want to keep.**
 
 Intermediate processing files can be retained with `keep_intermediates = true` for troubleshooting or inspection.
 
-When both Astro and Duo-Band results are produced, `align_filters = true` registers them against each other and uses common framing so the two final images are pixel-aligned. Set it to `false` to leave the two results independently framed.
+When more than one filter/exposure result is produced, `align_filters = true`
+registers all of them together with two-pass global registration and crops them
+to their common area. Set it to `false` to leave the results independently
+framed and skip exposure-length blending.
