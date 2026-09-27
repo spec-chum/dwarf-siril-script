@@ -103,9 +103,14 @@ When `use_weighted_fwhm = true`, Siril weights accepted frames by weighted
 FWHM during stacking.
 
 The four `filter_*` settings retain the specified percentage of best registered
-frames for weighted FWHM, roundness, background and star count. A value of
-`100.0` disables that filter, which means the supplied defaults do not reject
-frames by these quality measurements.
+frames for weighted FWHM, roundness, background and star count. The filters are
+applied while Siril exports the registered sequence. Siril then selects a new
+reference from the surviving frames before stacking. The surviving frame with
+the lowest weighted FWHM is explicitly made the reference, ensuring that it is
+both accepted by every enabled filter and valid for normalization. This second
+reference-selection pass does not resample the images again. A value of `100.0`
+disables that filter, which means the supplied defaults do not reject frames by
+these quality measurements.
 
 `sigma_low` and `sigma_high` are the lower and upper thresholds for winsorized
 sigma rejection.

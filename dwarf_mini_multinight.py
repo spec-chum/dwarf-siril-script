@@ -164,6 +164,48 @@ def filter_args(
     return args
 
 
+def set_best_wfwhm_reference(siril, sequence_name):
+    """Set the lowest-wFWHM included frame as a sequence's reference."""
+    sequence = siril.get_seq()
+    if sequence is None:
+        raise RuntimeError(
+            f"Cannot select a reference for {sequence_name}: no sequence is loaded."
+        )
+
+    candidates = []
+    channel_count = max(1, sequence.nb_layers)
+
+    for frame_index in range(sequence.number):
+        image_data = siril.get_seq_imgdata(frame_index)
+        if image_data is None or not image_data.incl:
+            continue
+
+        for channel in range(channel_count):
+            registration = siril.get_seq_regdata(frame_index, channel)
+            if registration is None:
+                continue
+
+            weighted_fwhm = float(registration.weighted_fwhm)
+            if math.isfinite(weighted_fwhm) and weighted_fwhm > 0:
+                candidates.append((weighted_fwhm, frame_index))
+                break
+
+    if not candidates:
+        raise RuntimeError(
+            f"Cannot select a reference for {sequence_name}: "
+            "no included frame has valid weighted-FWHM data."
+        )
+
+    weighted_fwhm, frame_index = min(candidates)
+    # SETREF uses a one-based sequential frame number, not the filename index.
+    run(siril, "setref", sequence_name, frame_index + 1)
+    siril.log(
+        f"Using frame {frame_index + 1} as the {sequence_name} reference "
+        f"(best surviving wFWHM={weighted_fwhm:.4g}).",
+        s.LogColor.GREEN,
+    )
+
+
 def measure_image_noise(siril):
     """Return one background-noise estimate for the currently loaded image."""
     image = siril.get_image(with_pixels=True)
@@ -563,19 +605,57 @@ def main():
                 f"({drizzle_scale:g}x)...",
                 s.LogColor.GREEN,
             )
-            run(siril, "register", combined_seq,
-                f"-scale={drizzle_scale:g}", "-transf=homography",
-                "-minpairs=10", "-maxstars=2000", "-drizzle",
-                f"-pixfrac={pixel_fraction:.2f}", f"-kernel={DRIZZLE_KERNEL}")
+            # Compute provisional registration data first. Siril needs those
+            # measurements before it can apply the configured quality filters.
+            run(
+                siril,
+                "register",
+                combined_seq,
+                "-2pass",
+                "-transf=homography",
+                "-minpairs=10",
+                "-maxstars=2000",
+            )
+            apply_registration = [
+                "seqapplyreg",
+                combined_seq,
+                f"-scale={drizzle_scale:g}",
+                "-drizzle",
+                f"-pixfrac={pixel_fraction:.2f}",
+                f"-kernel={DRIZZLE_KERNEL}",
+            ]
+            quality_filters = filter_args(
+                filter_wfwhm,
+                filter_round,
+                filter_background,
+                filter_star_count,
+            )
+            apply_registration.extend(quality_filters)
+            run(siril, *apply_registration)
 
             registered_seq = "r_" + combined_seq
+            # The provisional reference may have been rejected by one of the
+            # quality filters. Re-register the exported survivors without
+            # producing another image sequence so Siril selects the best
+            # surviving frame as the stacking/normalization reference. The
+            # pixels are already aligned and are not resampled a second time.
+            if quality_filters:
+                run(
+                    siril,
+                    "register",
+                    registered_seq,
+                    "-2pass",
+                    "-transf=homography",
+                    "-minpairs=10",
+                    "-maxstars=2000",
+                )
+                set_best_wfwhm_reference(siril, registered_seq)
+
             stack = ["stack", registered_seq, "rej", "winsorized",
                      f"{sigma_low:g}", f"{sigma_high:g}",
                      "-norm=addscale", "-output_norm", "-32b"]
             if use_weighted_fwhm:
                 stack.append("-weight=wfwhm")
-            stack.extend(filter_args(filter_wfwhm, filter_round,
-                                     filter_background, filter_star_count))
             filter_result_name = (
                 f"{result_name}_{filter_label}_{exposure:g}s"
             )
@@ -593,7 +673,8 @@ def main():
                 raise RuntimeError(f"Stack completed but output file was not found: {stacked_path}")
 
             # Siril writes the actual integration represented by the stack to
-            # LIVETIME. This accounts for frames excluded by stack filtering.
+            # LIVETIME. This accounts for frames excluded during registered
+            # sequence export.
             run(siril, "load", filter_result_name)
             header = siril.get_image_fits_header(return_as="dict") or {}
             try:
