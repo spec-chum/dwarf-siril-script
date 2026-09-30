@@ -80,7 +80,7 @@ Short version of the main settings:
 
 - `drizzle_scale` sets the Bayer-drizzle output size.
 - `pixel_fraction` sets the drizzle drop size.
-- `use_weighted_fwhm` turns on weighted-FWHM stacking.
+- `use_weighted_fwhm` controls stack weighting: `true` uses weighted-FWHM, `false` uses noise weighting.
 - `filter_*` keeps only the best percentage of registered frames by FWHM,
   roundness, background, and star count. Set a value to `100.0` to disable it.
 - `sigma_low` and `sigma_high` control winsorized sigma rejection.

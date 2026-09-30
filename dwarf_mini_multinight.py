@@ -286,6 +286,7 @@ def main():
         result_name = config.get(
             "processing", "result_name", fallback="result"
         )
+        stack_weight_mode = "wfwhm" if use_weighted_fwhm else "noise"
 
         base_dir = root
 
@@ -300,6 +301,7 @@ def main():
             f"({'loaded' if config_exists else 'not found - using defaults'}) | "
             f"drizzle {drizzle_scale:g}x | "
             f"pixfrac {pixel_fraction:.2f} | WFWHM {filter_wfwhm:g}% | "
+            f"stack weight {stack_weight_mode} | "
             f"sigma {sigma_low:g}/{sigma_high:g} | "
             f"keep intermediates {keep_intermediates} | "
             f"align results {align_results} | "
@@ -656,6 +658,8 @@ def main():
                      "-norm=addscale", "-output_norm", "-32b"]
             if use_weighted_fwhm:
                 stack.append("-weight=wfwhm")
+            else:
+                stack.append("-weight=noise")
             filter_result_name = (
                 f"{result_name}_{filter_label}_{exposure:g}s"
             )
